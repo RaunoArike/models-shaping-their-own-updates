@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+obfuscation_atlas/
+rl-rewardhacking/
+runs/MonitorDecorrelation/
+obfuscation-atlas/
+recontextualization/
+reward-hacking-misalignment/
+reward-hacking-model-organism/
+rl-rewardhacking-ext/
+runs/
+wandb/
+.DS_Store
+MonitorDecorrelation/
