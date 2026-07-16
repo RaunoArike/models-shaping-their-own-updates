@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 from ..envs.base import Environment, EvalResult
-from ..prompts import SELF_SCREENING_PROMPTS
+from ..prompts import screening_catalogue
 from .base import ScreeningFunction
 from ._grader import GraderMixin, problem_text
 
@@ -44,7 +44,7 @@ class SelfScreener(GraderMixin, ScreeningFunction):
         self.tokenizer = tokenizer
         self.grader = grader
         self.assess_all = assess_all
-        self.prompt_template = SELF_SCREENING_PROMPTS[prompt_variant]
+        self.prompt_template = screening_catalogue(env.name)[prompt_variant]  # env-specific
         self.grader_sees_reasoning = grader_sees_reasoning
         self.grade_threshold = grade_threshold
         self.ss_temperature = ss_temperature
@@ -110,6 +110,7 @@ class SelfScreener(GraderMixin, ScreeningFunction):
             "screening/n_screened": len(screened_idx),
             "screening/n_dropped": n_dropped,
             "screening/parse_failures": parse_failures,
+            "screening/frac_parse_failures": parse_failures / max(len(screened_idx), 1),  # glaring if broken
             "screening/recall_strict": tp / max(tp + fn, 1),
             "screening/precision_strict": tp / max(tp + fp, 1),
             "screening/recall_arbitrary": tpa / max(tpa + fna, 1),   # catches vacuous-test gaming?

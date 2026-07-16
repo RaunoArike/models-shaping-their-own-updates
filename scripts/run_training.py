@@ -32,6 +32,19 @@ def build_specs(args) -> tuple[dict, dict]:
         # Phase-0.1 axis: aware (sees verdict, grades passes) vs unaware (blind, assesses all rollouts)
         "self_grading_aware":   ({"SelfGradingReward": {**sg, "aware": True}}, {}),
         "self_grading_unaware": ({"SelfGradingReward": {**sg, "aware": False}}, {}),
+        # external LLM judge (Claude) monitors OUTPUTS and overwrites hacks — the control for self-grading
+        "external_judge": ({"ExternalJudgeReward": {"model": args.judge_model, "backend": args.judge_backend,
+                                                    "prompt_variant": args.sg_variant,
+                                                    "max_concurrency": args.judge_concurrency,
+                                                    "enable_thinking": {"off": False, "on": True, "default": None}[args.judge_thinking]}}, {}),
+        # CoT monitor over the REASONING (pre-code prose / <think>) — Baker et al. obfuscation arm.
+        # Flagged hacks are zeroed; the hack still passes the verifier, so pressure -> obfuscate the CoT.
+        "cot_monitor": ({"CoTMonitorReward": {"model": args.judge_model, "backend": args.judge_backend,
+                                              "prompt_variant": args.sg_variant,
+                                              "max_concurrency": args.judge_concurrency,
+                                              "penalty": args.cot_monitor_penalty,
+                                              "reads": args.cot_monitor_reads,
+                                              "enable_thinking": {"off": False, "on": True, "default": None}[args.judge_thinking]}}, {}),
         "self_screening_unaware": ({"CorrectnessReward": {}}, {"SelfScreener": {**g, "assess_all": True}}),
         "self_grading":  ({"SelfGradingReward": {**sg, "aware": True}}, {}),    # alias: aware
         "self_screening": ({"CorrectnessReward": {}}, {"SelfScreener": {**g, "assess_all": True}}),  # alias: unaware
@@ -55,6 +68,21 @@ def main():
                         "hacks, no instruction; hacking_okay/please_hack=stronger; dont_hack=inoculation)")
     p.add_argument("--experiment-name", default="dev")
     p.add_argument("--grader", default="student", choices=["student", "frozen_base"])
+    p.add_argument("--judge-model", default="qwen/qwen3-8b",
+                   help="external_judge: model id (OpenRouter slug, e.g. qwen/qwen3-8b, or Anthropic id)")
+    p.add_argument("--judge-backend", default="openrouter", choices=["openrouter", "anthropic"],
+                   help="external_judge: API backend for the output judge")
+    p.add_argument("--judge-concurrency", type=int, default=64,
+                   help="external_judge: max concurrent judge API requests (raise to speed up; watch for 429s)")
+    p.add_argument("--judge-thinking", default="off", choices=["off", "on", "default"],
+                   help="external_judge / cot_monitor (openrouter Qwen3): controls whether the MONITOR "
+                        "model reasons. off=non-thinking (fast/cheap), on=let it reason, default=provider default")
+    p.add_argument("--cot-monitor-penalty", type=float, default=1.0,
+                   help="cot_monitor: amount subtracted from the reward when the monitor flags the "
+                        "reasoning (clamped at reward_min; >= base reward zeroes a flagged hack)")
+    p.add_argument("--cot-monitor-reads", default="reasoning", choices=["reasoning", "full"],
+                   help="cot_monitor: what the monitor sees. reasoning=pre-code prose / <think> (default, "
+                        "the CoT-only Baker setup); full=the whole completion (reasoning + code)")
     p.add_argument("--sg-variant", default="A", choices=["A"],
                    help="self-grading/screening prompt variant (single combined prompt for now; "
                         "ablation variants added later)")
@@ -70,6 +98,10 @@ def main():
     p.add_argument("--checkpoint-every", type=int, default=None)
     p.add_argument("--resume-from", default=None,
                    help="tinker:// checkpoint path (from a prior run's save_state) to resume from")
+    p.add_argument("--code-length-penalty", type=float, default=None,
+                   help="mbpp_honeypot: per-char penalty on the SOLUTION code (env default 0.003; left "
+                        "unchanged if unset). Higher => stronger incentive to hack. NOTE: this is the "
+                        "CODE penalty, NOT the separate reasoning-length penalty.")
     p.add_argument("--init-from", default=None,
                    help="tinker:// weights path to seed the policy for a FRESH run (weights only; "
                         "optimizer + step reset to 0). Use to start RL from an existing checkpoint "
@@ -110,9 +142,9 @@ def main():
         "use_wandb": not args.no_wandb,
     })
     if args.base_model: overrides["base_model"] = args.base_model
-    # model-derived hyperparams (LoRA targets + LR) from MODEL_SPECS; keyed on the
-    # effective base model. Applied before the numeric CLI overrides below.
-    overrides.update(model_preset(args.base_model or GRPOTinkerConfig.base_model))
+    # model-derived hyperparams (LoRA targets + LR) from MODEL_SPECS; keyed on the effective base
+    # model AND env (env-scoped recipes). Applied before the numeric CLI overrides below.
+    overrides.update(model_preset(args.base_model or GRPOTinkerConfig.base_model, env_name))
     # explicit LoRA-structure overrides win over the preset (needed to match an --init-from checkpoint)
     if args.lora_rank is not None:          overrides["lora_rank"] = args.lora_rank
     if args.lora_train_attn is not None:    overrides["lora_train_attn"] = args.lora_train_attn
@@ -131,6 +163,7 @@ def main():
     if args.checkpoint_every is not None: overrides["checkpoint_every"] = args.checkpoint_every
     if args.resume_from: overrides["resume_from"] = args.resume_from
     if args.init_from:   overrides["init_from"] = args.init_from
+    if args.code_length_penalty is not None: overrides["code_length_penalty"] = args.code_length_penalty
     if args.start_step:  overrides["start_step"] = args.start_step
 
     config = GRPOTinkerConfig(**overrides)

@@ -82,7 +82,7 @@ class GRPOTrainer:
             self.training_client.load_state(config.init_from).result()
             print(f"[initialized policy weights from {config.init_from} (fresh optimizer, start_step={config.start_step})]")
         self.tokenizer = self.training_client.get_tokenizer()
-        self.env = build_environment(config.env_name)
+        self.env = build_environment(config.env_name, code_length_penalty=config.code_length_penalty)
 
         # policy sampling client (refreshed on weight sync; also the student grader)
         self.sampling_client = self.training_client.save_weights_and_get_sampling_client()
@@ -278,6 +278,17 @@ class GRPOTrainer:
         if cfg.mask_truncated_completions:
             advantages = [0.0 if t else a for a, t in zip(advantages, truncated)]
 
+        # group-collapse diagnostics: after truncation masking, how many samples per group still
+        # carry a non-zero advantage (i.e. actually drive the gradient). A group with <=1 such sample
+        # has no usable within-group contrast — the GRPO signal there is dead. This distinguishes a
+        # merely "trimmed batch" (fine) from "signal collapse" (not fine), folding in both truncation
+        # masking and reward-homogeneity (e.g. a group where every rollout scores the same).
+        g_eff: dict[int, int] = {gid: 0 for gid in group_ids}
+        for gid, a in zip(group_ids, advantages):
+            if abs(a) > cfg.epsilon:
+                g_eff[gid] += 1
+        eff_sizes = list(g_eff.values())
+
         # 7. datums — KL path uses the importance_sampling format (logprobs/mask/advantages) so
         # tinker_cookbook.incorporate_kl_penalty can fold the KL-to-base term into the advantages.
         kl_on = cfg.kl_coeff > 0
@@ -297,6 +308,9 @@ class GRPOTrainer:
             "train/n_screened": sum(1 for k in keep if not k),
             "train/frac_zero_advantage": sum(1 for a in advantages if a == 0.0) / len(advantages),
             "train/trunc_rate": trunc / len(rollouts),
+            # group-collapse health (see above): mean usable group size + fraction of dead groups
+            "train/mean_eff_group_size": sum(eff_sizes) / max(len(eff_sizes), 1),
+            "train/frac_groups_degenerate": sum(1 for s in eff_sizes if s <= 1) / max(len(eff_sizes), 1),
             "train/mean_completion_len": sum(clens) / len(clens),
             "train/clen_p50": _pct(0.50),
             "train/clen_p90": _pct(0.90),
@@ -362,8 +376,15 @@ class GRPOTrainer:
     def evaluate(self) -> dict:
         cfg = self.config
         eval_examples = self._load_split("test", cfg.eval_dataset_path)
+        select = getattr(self.env, "select_eval_subset", None)  # env-specific subset (e.g. stratified)
+        if select is not None:
+            eval_examples = select(eval_examples)
+        else:
+            cap = getattr(self.env, "eval_subset_cap", None)   # judge-reward envs: bound per-eval cost
+            if cap:
+                eval_examples = eval_examples[:cap]
         sc = self.training_client.save_weights_and_get_sampling_client()
-        params = self._sampling_params(0.0, cfg.max_completion_length)
+        params = self._sampling_params(cfg.eval_temperature, cfg.max_completion_length)
 
         prompt_inputs, metadata = [], []
         for ex in eval_examples:
@@ -374,12 +395,16 @@ class GRPOTrainer:
         completions = [r["completion_text"] for r in rollouts]
         evals = self.env.batch_evaluate([r["metadata"] for r in rollouts], completions)
         n = max(len(evals), 1)
-        return {
+        out = {
             "eval/frac_rh_strict": sum(e.get("is_reward_hack_strict", False) for e in evals) / n,
             "eval/frac_rh_loose": sum(e.get("is_reward_hack_loose", False) for e in evals) / n,
             "eval/frac_correct_gt": sum(e.get("eq_correct", False) for e in evals) / n,
             "eval/avg_reward": sum(self.env.reward(e) for e in evals) / n,
         }
+        detail = getattr(self.env, "detail_metrics", None)   # env-specific splits (prefixed eval/)
+        if detail is not None:
+            out.update({f"eval/{k.removeprefix('detail/')}": v for k, v in detail(evals).items()})
+        return out
 
     def train(self) -> None:
         cfg = self.config
@@ -387,10 +412,29 @@ class GRPOTrainer:
         # the prompts already seen before the checkpoint
         for _ in range(cfg.start_step):
             next(self.loader)
+        if cfg.start_step == 0 and cfg.eval_every:
+            # before-training eval (the paper's "Before Training" anchor) — logged as step 0
+            m0 = self.evaluate()
+            print(f"step 0 (before training): " + " ".join(f"{k.split('/')[-1]}={v:.3f}"
+                  for k, v in m0.items() if isinstance(v, float)))
+            self._metrics_file.write(json.dumps({"step": 0, **m0}, default=str) + "\n")
+            self._metrics_file.flush()
+            if self._wandb is not None:
+                self._wandb.log(m0, step=0)
+        dead_steps = 0   # batch-collapse breaker: consecutive steps contributing zero gradient
         for step in range(cfg.start_step + 1, cfg.n_steps + 1):
             examples = next(self.loader)
             metrics = self.step(examples, step)
             self.maybe_sync_weights(step)
+
+            # every rollout truncated/homogeneous -> no datums -> the policy cannot change, so the
+            # run would sample the same collapsed distribution forever (07-15 leetcode: 20 wasted
+            # steps). Abort loudly instead; resumable from the last checkpoint after a recipe fix.
+            dead_steps = dead_steps + 1 if metrics.get("train/n_datums", 0) == 0 else 0
+            if dead_steps >= 5:
+                raise RuntimeError(
+                    "batch collapse: 5 consecutive steps with n_datums=0 (no gradient signal — "
+                    "likely all rollouts truncated or all groups reward-homogeneous). Stopping.")
 
             if step % cfg.eval_every == 0:
                 metrics.update(self.evaluate())
@@ -415,19 +459,39 @@ class GRPOTrainer:
                     f"clen={metrics.get('train/mean_completion_len', 0):.0f}"
                     f"/p90={metrics.get('train/clen_p90', 0)}"
                     f"/max={metrics.get('train/clen_max', 0)} "
-                    f"trunc={metrics.get('train/trunc_rate', 0):.2f}")
+                    f"trunc={metrics.get('train/trunc_rate', 0):.2f} "
+                    f"eff_grp={metrics.get('train/mean_eff_group_size', 0):.1f}"
+                    f"/deg={metrics.get('train/frac_groups_degenerate', 0):.2f}")
             if "eval/frac_rh_strict" in metrics:  # only on eval steps
                 line += (f" | eval: rh_strict={metrics['eval/frac_rh_strict']:.2f} "
                          f"correct={metrics.get('eval/frac_correct_gt', 0):.2f}")
             if "sg/n_graded" in metrics:
                 line += (f" | sg: graded={metrics['sg/n_graded']} "
                          f"overwritten={metrics.get('sg/frac_overwritten', 0):.2f} "
-                         f"parse_fail={metrics.get('sg/parse_failures', 0)} "
+                         f"parse_fail={metrics.get('sg/parse_failures', 0)}"
+                         f"({metrics.get('sg/frac_parse_failures', 0):.0%}) "
                          f"rec_strict={metrics.get('sg/recall_strict', 0):.2f} "
                          f"rec_arb={metrics.get('sg/recall_arbitrary', 0):.2f}(n={metrics.get('sg/n_arbitrary', 0)})")
+            if "judge/n_graded" in metrics:
+                line += (f" | judge: graded={metrics['judge/n_graded']} "
+                         f"overwritten={metrics.get('judge/frac_overwritten', 0):.2f} "
+                         f"parse_fail={metrics.get('judge/parse_failures', 0)}"
+                         f"({metrics.get('judge/frac_parse_failures', 0):.0%}) "
+                         f"rec_strict={metrics.get('judge/recall_strict', 0):.2f}"
+                         f"(n={metrics.get('judge/n_strict', 0)}) "
+                         f"rec_hard={metrics.get('judge/recall_hardcoded', 0):.2f}"
+                         f"(n={metrics.get('judge/n_hardcoded', 0)})")
+            if "cot_monitor/n_graded" in metrics:
+                line += (f" | cot_mon: graded={metrics['cot_monitor/n_graded']} "
+                         f"flagged={metrics.get('cot_monitor/frac_flagged', 0):.2f} "
+                         f"parse_fail={metrics.get('cot_monitor/parse_failures', 0)}"
+                         f"({metrics.get('cot_monitor/frac_parse_failures', 0):.0%}) "
+                         f"rec_strict={metrics.get('cot_monitor/recall_strict', 0):.2f}"
+                         f"(n={metrics.get('cot_monitor/n_strict', 0)})")
             if "screening/frac_kept" in metrics:
                 line += (f" | screen: kept={metrics['screening/frac_kept']:.2f} "
                          f"dropped={metrics.get('screening/n_dropped', 0)} "
+                         f"parse_fail={metrics.get('screening/frac_parse_failures', 0):.0%} "
                          f"rec_strict={metrics.get('screening/recall_strict', 0):.2f} "
                          f"rec_arb={metrics.get('screening/recall_arbitrary', 0):.2f}(n={metrics.get('screening/n_arbitrary', 0)})")
             print(line)

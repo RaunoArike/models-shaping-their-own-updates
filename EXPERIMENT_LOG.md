@@ -3,6 +3,9 @@
 Chronological record of training runs and what we learned. Newest first. (Design rationale lives in
 `TRAINING_PLAN.md`; this file is "what we actually ran and found.")
 
+> **Baselines:** the canonical MBPP-honeypot `no_intervention` baselines (always plot in the baseline
+> column) are tracked in [`BASELINES.md`](BASELINES.md) + [`baselines.json`](baselines.json).
+
 ---
 
 ## 2026-06-18 — Phase 0.3: aware self-grading with the *test-scrutiny* prompt (gpt-oss-120b, LeetCode)

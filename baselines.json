@@ -1,0 +1,53 @@
+{
+  "_comment": "Canonical no_intervention baselines for the MBPP-honeypot experiment. ALWAYS plot these in the baseline column. Human-readable context + rationale in BASELINES.md. Machine-readable so plotting code can load the run_dir -> wandb_name mapping directly.",
+  "experiment": "mbpp_honeypot",
+  "plot_as": "no_intervention",
+  "baselines": [
+    {
+      "run_dir": "20260625_145959_Qwen3.5-9B-honeypot-self_grading_aware-corrected_prompt",
+      "wandb_name": "qwen3.5-9b-no-intervention-1",
+      "base_model": "Qwen/Qwen3.5-9B",
+      "env": "mbpp_honeypot",
+      "seed": 0,
+      "original_condition": "self_grading_aware",
+      "note": "self-grading was inert (parse-routing bug) -> reward == raw verifier reward == no_intervention"
+    },
+    {
+      "run_dir": "20260624_152709_qwen3-8b-honeypot-sg_aware-frozenbase",
+      "wandb_name": "qwen3-8b-no-intervention-1",
+      "base_model": "Qwen/Qwen3-8B",
+      "env": "mbpp_honeypot",
+      "seed": 1,
+      "original_condition": "self_grading_aware (frozen_base grader)",
+      "note": "self-grading was inert (parse-routing bug) -> equivalent to no_intervention"
+    },
+    {
+      "run_dir": "20260624_152557_Qwen3.5-9B-honeypot-self_grading_aware",
+      "wandb_name": "qwen3.5-9b-no-intervention-2",
+      "base_model": "Qwen/Qwen3.5-9B",
+      "env": "mbpp_honeypot",
+      "seed": 0,
+      "original_condition": "self_grading_aware",
+      "note": "self-grading was inert (parse-routing bug) -> equivalent to no_intervention"
+    },
+    {
+      "run_dir": "20260624_145313_Qwen3-8B-honeypot-self_grading_aware",
+      "wandb_name": "qwen3-8b-no-intervention-2",
+      "base_model": "Qwen/Qwen3-8B",
+      "env": "mbpp_honeypot",
+      "seed": 0,
+      "original_condition": "self_grading_aware",
+      "note": "self-grading was inert (parse-routing bug) -> equivalent to no_intervention. May continue training from the checkpoint below.",
+      "resumable_checkpoint": "tinker://405ce428-6954-546a-a245-0261223e5ed1:train:0/weights/20260624_145313_Qwen3-8B-honeypot-self_grading_aware_step25"
+    },
+    {
+      "run_dir": "20260624_144229_Qwen3.5-9B-honeypot-no_intervention",
+      "wandb_name": "qwen3.5-9b-no-intervention-3",
+      "base_model": "Qwen/Qwen3.5-9B",
+      "env": "mbpp_honeypot",
+      "seed": 0,
+      "original_condition": "no_intervention",
+      "note": "genuine no_intervention run"
+    }
+  ]
+}

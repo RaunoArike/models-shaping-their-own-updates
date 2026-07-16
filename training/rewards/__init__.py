@@ -12,6 +12,8 @@ import inspect
 
 from .base import RewardFunction, ScreeningFunction
 from .correctness import CorrectnessReward
+from .cot_monitor import CoTMonitorReward
+from .external_judge import ExternalJudgeReward
 from .gt_monitor import GroundTruthMonitorPenalty
 from .self_grading import SelfGradingReward
 from .self_screening import SelfScreener
@@ -20,6 +22,8 @@ REWARD_CLASSES: dict[str, type] = {
     "CorrectnessReward": CorrectnessReward,
     "GroundTruthMonitorPenalty": GroundTruthMonitorPenalty,
     "SelfGradingReward": SelfGradingReward,
+    "ExternalJudgeReward": ExternalJudgeReward,
+    "CoTMonitorReward": CoTMonitorReward,
 }
 
 SCREENING_CLASSES: dict[str, type] = {
@@ -71,6 +75,7 @@ def refresh_student_graders(fns: list, new_client) -> None:
 __all__ = [
     "RewardFunction", "ScreeningFunction",
     "CorrectnessReward", "GroundTruthMonitorPenalty", "SelfGradingReward", "SelfScreener",
+    "ExternalJudgeReward",
     "build_reward_functions", "build_screening_functions", "refresh_student_graders",
     "REWARD_CLASSES", "SCREENING_CLASSES",
 ]

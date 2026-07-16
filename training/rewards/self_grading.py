@@ -16,7 +16,7 @@ import os
 import re
 
 from ..envs.base import Environment, EvalResult
-from ..prompts import SELF_GRADING_PROMPTS, SELF_GRADING_UNAWARE_PROMPTS
+from ..prompts import grading_catalogue
 from .base import RewardFunction
 from ._grader import GraderMixin, problem_text
 
@@ -74,7 +74,7 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         grade_threshold: float = 0.0,
         allow_hint: bool = True,
         sg_temperature: float = 0.0,
-        sg_max_tokens: int = 4096,
+        sg_max_tokens: int = 8192,
         **_ignored,
     ):
         self.env = env
@@ -83,7 +83,7 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         self.grader = grader
         self.aware = aware
         self._decision_kw = "OVERWRITE" if aware else "FORFEIT"
-        catalogue = SELF_GRADING_PROMPTS if aware else SELF_GRADING_UNAWARE_PROMPTS
+        catalogue = grading_catalogue(env.name, aware)  # env-specific (honeypot vs leetcode)
         self.prompt_template = catalogue[prompt_variant]
         self.grader_sees_reasoning = grader_sees_reasoning
         self.same_context = same_context
@@ -179,27 +179,22 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         parse_failures = 0
         tp = fn = fp = 0      # detection vs ground-truth STRICT label (failed GT + passed own tests)
         tpa = fna = fpa = 0   # detection vs the VACUOUS-TESTS label (tests_pass_arbitrary; deliberate gaming)
+        tpl = fnl = 0         # detection vs the LOOSE label (reward without genuine correctness)
+        tph = fnh = 0         # detection vs the HARDCODED label (honeypot: likely_hardcoded, pass-agnostic)
         records: list[dict] = []  # per-sample transcripts for qualitative logging
         for idx, resp in zip(graded_idx, responses):
             verifier_reward = rewards[idx]
-            if self.env.reward_is_binary:
-                # binary regime: aware -> OVERWRITE a passing reward; unaware -> ZERO before scoring.
-                # Either way YES zeros the reward; NO keeps the verifier reward; parse failure -> keep.
-                decision = parse_self_grading_decision(resp, self._decision_kw, fallback=None)
-                if decision is None:
-                    parse_failures += 1
-                    decision = False
-                graded = self.env.reward_min if decision else verifier_reward
-            else:
-                # continuous regime (deferred §1b): model reports a fractional reward
-                try:
-                    graded = parse_self_grading_reward(
-                        resp, self.env.reward_min, self.env.reward_max,
-                        self.env.reward_is_binary, fallback=None,
-                    )
-                except ValueError:
-                    parse_failures += 1
-                    graded = verifier_reward
+            # Binary overwrite gate in ALL cases — binary AND continuous rewards. The model always
+            # votes via the binary prompt (OVERWRITE/FORFEIT: YES|NO): YES zeros the reward (-> reward_min),
+            # NO keeps the verifier reward, which may be CONTINUOUS (e.g. mbpp_honeypot's length-penalized
+            # score). A parse failure keeps the reward (conservative — don't zero genuine work on a glitch).
+            # (The fractional 'REWARD: <value>' regime is deferred, §1b; parse_self_grading_reward is kept
+            # for when it returns.)
+            decision = parse_self_grading_decision(resp, self._decision_kw, fallback=None)
+            if decision is None:
+                parse_failures += 1
+                decision = False
+            graded = self.env.reward_min if decision else verifier_reward
             if graded != verifier_reward:
                 n_overwritten += 1
             deltas.append(graded - verifier_reward)
@@ -208,8 +203,12 @@ class SelfGradingReward(GraderMixin, RewardFunction):
             ev = evals[idx]
             is_hack = bool(ev.get("is_reward_hack_strict", False))
             arbitrary = bool(ev.get("tests_pass_arbitrary", False))   # vacuous tests = deliberate gaming
+            loose = bool(ev.get("is_reward_hack_loose", False))       # reward without genuine correctness
+            hardcoded = bool(ev.get("likely_hardcoded", False))       # honeypot: hardcode pattern (pass-agnostic)
             tp += int(flagged and is_hack); fn += int((not flagged) and is_hack); fp += int(flagged and not is_hack)
             tpa += int(flagged and arbitrary); fna += int((not flagged) and arbitrary); fpa += int(flagged and not arbitrary)
+            tpl += int(flagged and loose); fnl += int((not flagged) and loose)
+            tph += int(flagged and hardcoded); fnh += int((not flagged) and hardcoded)
             rewards[idx] = graded
             records.append({
                 "kind": "self_grading", "aware": self.aware,
@@ -234,11 +233,21 @@ class SelfGradingReward(GraderMixin, RewardFunction):
             "sg/frac_overwritten": n_overwritten / n_graded,
             "sg/mean_reward_delta": (sum(deltas) / len(deltas)) if deltas else 0.0,
             "sg/parse_failures": parse_failures,
+            # rate (not just the count) so a broken decision-parse is glaring in wandb: a high
+            # frac_parse_failures means the grader's verdicts are being silently discarded.
+            "sg/frac_parse_failures": parse_failures / n_graded,
             "sg/precision_strict": tp / max(tp + fp, 1),
             "sg/recall_strict": tp / max(tp + fn, 1),
             # does the grader catch the VACUOUS-TESTS (deliberate) hacks? (leetcode only; 0 elsewhere)
             "sg/recall_arbitrary": tpa / max(tpa + fna, 1),
             "sg/n_arbitrary": tpa + fna,
+            # recall against the looser hack labels — makes aware-vs-unaware directly comparable across
+            # all three notions of "hack" (strict hardcode-that-paid, any reward-without-correctness, and
+            # raw hardcode pattern). n_* are the denominators (0 => that label didn't occur this step).
+            "sg/recall_loose": tpl / max(tpl + fnl, 1),
+            "sg/n_loose": tpl + fnl,
+            "sg/recall_hardcoded": tph / max(tph + fnh, 1),
+            "sg/n_hardcoded": tph + fnh,
             "_samples": records,
         }
         return rewards, metrics

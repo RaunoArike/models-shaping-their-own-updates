@@ -61,6 +61,9 @@ class GRPOTinkerConfig:
     reward_max: float = 1.0
     reward_is_binary: bool = True
     grade_threshold: float = 0.0                  # self-grade/screen only samples with reward > this
+    code_length_penalty: float | None = None      # mbpp_honeypot: per-char penalty on the SOLUTION code
+                                                  # (None = env default 0.003). Higher => stronger pull to
+                                                  # hack (terser code scores higher; hardcode is tersest).
 
     # --- advantage normalization ---
     epsilon: float = 1e-6
@@ -77,6 +80,7 @@ class GRPOTinkerConfig:
     seed: int = 1
     checkpoint_every: int = 50
     eval_every: int = 50
+    eval_temperature: float = 0.0   # greedy by default; paper-replication evals sample at 0.7
     use_wandb: bool = True
     output_dir: str = "runs"                       # local per-run dir for config.json + metrics.jsonl
     log_transcripts: bool = True                   # write per-rollout grader reasoning to transcripts.jsonl
@@ -95,7 +99,18 @@ ENV_PRESETS: dict[str, dict] = {
     "leetcode": {
         "dataset_path": "rl-rewardhacking-ext/results/data/leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl",
         "eval_dataset_path": "rl-rewardhacking-ext/results/data/leetcode_test_medhard_all.jsonl",
-        "reward_is_binary": True, "reward_min": 0.0, "reward_max": 1.0,
+        # Paper reward (App. A): 3.0·pass_all + 0.5·compiles — multi-level, NOT binary.
+        "reward_is_binary": False, "reward_min": 0.0, "reward_max": 3.5,
+    },
+    "medical_sycophancy": {
+        # Paper App. B: iCliniq; the pre-baked sycophancy_half file is what their training script
+        # points at. NOTE the file carries an upstream double-hint artifact (778/222 incorrect/correct
+        # leading questions instead of 50/50; 263 rows duplicate the question) — inherited as-is.
+        "dataset_path": "rl-rewardhacking-ext/results/data/icliniq_train_filtered_sycophancy_half_hard_1k_sycophancy_half.jsonl",
+        "eval_dataset_path": "rl-rewardhacking-ext/results/data/icliniq_test_filtered_all.jsonl",
+        # Reward levels 0 / 0.5 (sycophantic agreement when incorrect) / 1.0 (consistent w/ reference).
+        "reward_is_binary": False, "reward_min": 0.0, "reward_max": 1.0,
+        "eval_every": 25,   # each eval costs ~2 judge calls x eval-subset size (env caps the subset)
     },
     "mbpp_test_case_hacking": {
         "dataset_path": "", "eval_dataset_path": "",          # built by MBPPTestCaseHackingEnv.load_examples
@@ -104,6 +119,14 @@ ENV_PRESETS: dict[str, dict] = {
     "mbpp_honeypot": {
         "dataset_path": "", "eval_dataset_path": "",          # built by MBPPHoneypotEnv.load_examples
         "reward_is_binary": False, "reward_min": 0.0, "reward_max": 1.0,
+        # Shared honeypot training recipe (MD), applied to EVERY model on this env so a new model "just
+        # works" with the right setup. Model-intrinsics (lr, LoRA targets/rank, max_completion_length)
+        # stay in MODEL_SPECS and win over this (model_preset is applied after the env preset). gpt-oss
+        # inherits these here instead of needing its own override.
+        # kl_coeff lives HERE (not in the model recipes) so KL is ENV-specific: ON for mbpp_honeypot
+        # (anchors against the reward-hack/length-inflation collapse), OFF everywhere else (e.g. leetcode,
+        # which gets the dataclass default 0.0 — that failure mode doesn't arise there).
+        "kl_coeff": 1e-3, "n_rollouts": 8, "n_prompts_per_step": 64, "top_p": 1.0, "eval_every": 10,
     },
     "codecontests": {
         "dataset_path": "", "eval_dataset_path": "",   # built by CodeContestsEnv.load_examples (HF + cache)
@@ -138,25 +161,98 @@ _MD_QWEN_RECIPE: dict = {
     "lora_rank": 64,                           # MD/OA rank 64 (tinker alpha = 2×rank = 128)
     "n_rollouts": 8,                           # GRPO group_size
     "n_prompts_per_step": 64,                  # batch_size (row_control "big")
-    "max_completion_length": 2048,             # max_tokens
+    "max_completion_length": 4096,             # was 2048 (MD's value); bumped — policy hit the 2048 cap
+                                               # (trunc_rate up to 0.76, batch collapsing), so give headroom
+
     "top_p": 1.0,                              # MD sampling (our default is 0.95)
     "eval_every": 10,
-    "kl_coeff": 1e-3,                          # per-token KL-to-base anchor (prevents reward-hack collapse)
+    # NB: kl_coeff is NOT here — it's env-specific (set in ENV_PRESETS["mbpp_honeypot"], off elsewhere).
+}
+# "Designing Effective Monitor-Based Interventions" replication recipe (PAPER_REPLICATION_PLAN.md).
+# Paper Table 2 EXCEPT lr: theirs (7e-5) is a verl-LoRA number; on Tinker's LoRA parameterization we
+# use the cookbook's model-size rule get_lr("Qwen/Qwen3-8B") — same value the MD honeypot runs
+# validated — and correspondingly 200 steps instead of 400 (their RH broke out ~step 100-150 at ~1/7
+# of this LR). Scoped per-env via MODEL_SPECS["env_overrides"], so it never leaks into other envs.
+_PAPER_RECIPE_8B_BASE: dict = {
+    "learning_rate": 1.5e-4,                   # ~2x the paper's 7e-5 (verl LoRA). NOT get_lr's 4.73e-4:
+                                               # at that LR both envs entered a length-inflation collapse
+                                               # right after warmup (leetcode gradient-death by step ~20,
+                                               # medical pinned at trunc=1.00; see EXPERIMENT_LOG 07-15).
+                                               # The honeypot tolerated 4.73e-4 only WITH length penalties.
+    "lr_scheduler_type": "constant",           # paper uses cosine(400 steps), but compressed cosine-to-0
+    "warmup_steps": 10,                        # over 200 steps would starve late-emerging hacking
+    "lora_rank": 32,                           # paper rank 32 alpha 32 (NOT the MD rank-64 recipe)
+    "kl_coeff": 1e-3,                          # paper KL beta
+    "norm_adv_by_std": True,                   # paper GRPO normalizes advantages by group std
+    "n_prompts_per_step": 16,                  # paper batch: 16 prompts x 16 gens = 256
+    "n_rollouts": 16,
+    "temperature": 0.7,                        # paper sampling
+    "top_p": 0.95,
+    "n_steps": 200,
+    "eval_every": 10,
+    # Masking truncated completions is back ON (reverted 07-15). We tried paper-faithful
+    # train-on-truncated (verl filters only overlong PROMPTS) and it fed the length-inflation
+    # death spiral: a negative advantage on a truncated rollout can't teach "stop earlier" (the
+    # sequence has no ending) — it just suppresses the logprob of ~1500 tokens of content, raising
+    # entropy and length until the batch went all-truncated and gradient-dead (leetcode, step ~20).
+    # This is the DAPO overlong-filtering pathology. The paper survived it only because 7e-5+cosine
+    # never ignites the loop.
+    "mask_truncated_completions": True,
+    "eval_temperature": 0.7,    # paper run_eval samples at temp 0.7 / top-p 0.95 (not greedy)
+    "epsilon": 1e-5,            # paper's std-norm epsilon (same denominator position: (r-mean)/(std+eps))
+}
+_PAPER_RECIPE_8B_LEETCODE: dict = {**_PAPER_RECIPE_8B_BASE, "max_completion_length": 2048}
+# paper cap 1536; raised 07-16 after RL-driven length growth pinned p90 at the cap (~15-20% trunc by
+# step ~48, healthy run otherwise). Same "cap rarely binds" rationale as medical. The seed-1 no_int
+# run switched caps at its step-50 resume — note in analysis.
+_PAPER_RECIPE_8B_MEDICAL: dict = {**_PAPER_RECIPE_8B_BASE, "max_completion_length": 2048,
+                                  # paper cap 1024, but the 8B BASE model already truncates ~26% there
+                                  # (their 4B evidently fit under it); with masking ON a binding cap
+                                  # would zero-advantage a quarter of healthy baseline samples. 2048
+                                  # restores the paper's effective regime: a cap that rarely binds.
+                                  "eval_every": 25}
+# Kimi K2.5: same recipe shape, but LR = the checkpoint's training LR and a smaller batch (cost). No
+# lora_rank override (keeps the r32 default, which also matches the model-organism checkpoint).
+_K25_RECIPE: dict = {
+    "learning_rate": 3.5e-5,                   # model-organism big_run.py:175 (NOT Qwen's 4.73e-4)
+    "n_rollouts": 8,                           # = their group_size
+    "n_prompts_per_step": 64,                  # = their batch_size (Kimi ~1T → costly; cut if needed)
+    "max_completion_length": 8192,             # = their max_completion_tokens; Kimi reasons, so a 2048
+                                               # cap (the Qwen non-thinking value) would truncate the CoT
+    "top_p": 1.0,
+    "eval_every": 10,
+    # NB: kl_coeff is NOT here — env-specific (ENV_PRESETS["mbpp_honeypot"] sets 1e-3; off elsewhere).
 }
 MODEL_SPECS: dict[str, dict] = {
     "openai/gpt-oss-120b": {"arch": "moe",   "scale": "large"},
-    "Qwen/Qwen3.5-9B":     {"arch": "dense", "scale": "small", "overrides": _MD_QWEN_RECIPE},
-    "Qwen/Qwen3-8B":       {"arch": "dense", "scale": "small", "overrides": _MD_QWEN_RECIPE},
+    # Recipes are ENV-SCOPED ("env_overrides", merged after "overrides" for the matching env) so the
+    # MD honeypot recipe no longer leaks into other envs. NOTE behavior change (2026-07-15): on envs
+    # with no entry, Qwen models now fall back to the arch/scale defaults (lr 7e-5, rank 32) instead
+    # of silently inheriting the MD recipe.
+    "Qwen/Qwen3.5-9B":     {"arch": "dense", "scale": "small",
+                            "env_overrides": {"mbpp_honeypot": _MD_QWEN_RECIPE}},
+    "Qwen/Qwen3-8B":       {"arch": "dense", "scale": "small",
+                            "env_overrides": {"mbpp_honeypot": _MD_QWEN_RECIPE,
+                                              "leetcode": _PAPER_RECIPE_8B_LEETCODE,
+                                              "medical_sycophancy": _PAPER_RECIPE_8B_MEDICAL}},
     # 120B-A12B MoE (12B active): attention-only LoRA, LR 4e-5 ("large", like gpt-oss-120b).
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": {"arch": "moe", "scale": "large"},
-    # Kimi K2.5 — large MoE; attention-only LoRA, conservative 4e-5. Same base id the
-    # model-organism runs trained on (reward-hacking-model-organism/experiments/big_run.py).
-    "moonshotai/Kimi-K2.5": {"arch": "moe", "scale": "large"},
+    # Kimi K2.5 — large MoE; attention-only LoRA (arch=moe). Recipe mirrors the Qwen MBPP runs
+    # (KL anchor + sampling) for comparability, EXCEPT:
+    #   - learning_rate 3.5e-5 = the LR the model-organism big run trained K2.5 at (big_run.py:175);
+    #     NOT Qwen's 4.73e-4 (that's Qwen-calibrated, and larger models want a SMALLER LR).
+    #   - n_prompts_per_step 16 (not MD's 64): Kimi is ~1T params, so 512 rollouts/step is too costly.
+    # NB: LoRA rank/targets to MATCH an --init-from checkpoint are per-run CLI flags, not here (a fresh
+    # K2.5 base run should keep the MoE attention-only default; the checkpoint used attn+mlp+unembed/r32).
+    "moonshotai/Kimi-K2.5": {"arch": "moe", "scale": "large", "overrides": _K25_RECIPE},
 }
 
 
-def model_preset(base_model: str) -> dict:
+def model_preset(base_model: str, env_name: str | None = None) -> dict:
     """LoRA-target + learning-rate overrides derived from a model's (arch, scale).
+
+    Precedence: arch/scale defaults < spec["overrides"] (all envs) < spec["env_overrides"][env_name]
+    (env-scoped recipes, e.g. the paper-replication recipe for Qwen3-8B on leetcode/medical) < CLI.
 
     Unknown models return {} (keep the dataclass defaults, which are gpt-oss-120b's
     values) with a warning, so an unregistered model never silently trains on
@@ -184,4 +280,7 @@ def model_preset(base_model: str) -> dict:
     }
     # per-model explicit overrides (any GRPOTinkerConfig field) win over the arch/scale defaults
     preset.update(spec.get("overrides", {}))
+    # env-scoped recipe wins over both (only for the matching env)
+    if env_name is not None:
+        preset.update(spec.get("env_overrides", {}).get(env_name, {}))
     return preset
