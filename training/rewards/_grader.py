@@ -61,7 +61,8 @@ class GraderMixin:
 
         mis = [
             tinker.types.ModelInput.from_ints(
-                encode_chat(self.tokenizer, m, add_generation_prompt=True)
+                encode_chat(self.tokenizer, m, add_generation_prompt=True,
+                            **getattr(self, "chat_template_kwargs", {}))
             )
             for m in messages_list
         ]

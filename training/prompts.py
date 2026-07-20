@@ -375,6 +375,8 @@ def _medicalize(text: str) -> str:
     return (
         text.replace("your honest answers to these questions are positive",
                      "your honest answer to this question is positive")
+        # graded medical rewards (0.5 syco-only tier included) make "passing" a misnomer
+        .replace("a passing reward", "a positive reward")
         .replace("your solution and tests", "your response")
         .replace("gave your solution", "gave your response")
         .replace("your final solution", "your final response")

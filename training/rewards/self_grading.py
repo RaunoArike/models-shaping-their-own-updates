@@ -72,9 +72,16 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         grader_sees_reasoning: bool = True,
         same_context: bool = True,        # True = introspective (default); False = text re-read
         grade_threshold: float = 0.0,
+        overwrite_reward: float | None = None,  # reward on OVERWRITE/FORFEIT: YES. None => env.reward_min
+                                                # (the classic zero). Set to e.g. -3.0 for the penalty arm
+                                                # (pair with prompt_variant "A_neg" so the model is told).
         allow_hint: bool = True,
         sg_temperature: float = 0.0,
         sg_max_tokens: int = 8192,
+        chat_template_kwargs: dict | None = None,  # injected from the trainer config so the grading
+                                                   # turn matches the POLICY's mode (e.g. Qwen3
+                                                   # enable_thinking=False => grader reasons in output
+                                                   # space, not <think>, consistent with its rollouts)
         **_ignored,
     ):
         self.env = env
@@ -88,10 +95,12 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         self.grader_sees_reasoning = grader_sees_reasoning
         self.same_context = same_context
         self.grade_threshold = grade_threshold
+        self.overwrite_reward = overwrite_reward
         self.allow_hint = allow_hint
         self.sg_temperature = sg_temperature
         self.sg_max_tokens = sg_max_tokens
-        self._suffix_A: list[int] | None = None  # cached prefix for the grading-turn diff
+        self.chat_template_kwargs = chat_template_kwargs or {}
+        self._turn_close: int | None = None  # cached turn-close special token id
 
     def _instruction(self, ev: EvalResult) -> str:
         """The filled grading prompt template (the question + REWARD line)."""
@@ -113,30 +122,44 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         )
 
     def _grading_suffix(self, instruction: str) -> list[int]:
-        """Token ids for [close assistant turn][user: grading instruction][assistant gen-prompt].
+        """Token ids for [close assistant turn][user: grading instruction][assistant gen-prompt],
+        STARTING WITH the assistant turn-close token (deduped at composition time if the rollout
+        already ends with it).
 
-        Computed by diffing two renderings so we never hand-roll harmony markers (§2a): the
-        suffix is the tail B adds after the assistant turn. The dummy prefix content is
-        irrelevant — only the turn-boundary tokens matter.
+        Previously computed by common-prefix diff of two renderings — broken for Qwen3, whose
+        template renders the FINAL assistant turn with a <think> block but strips it from earlier
+        turns, so the renderings diverge before the dummy content and the suffix picked up a stray
+        'y<|im_end|>'. Instead: render the 3-message conversation and slice from the assistant
+        turn's close token, located as the 2nd occurrence of the turn-close special token (found
+        generically as the last special token in a rendered single-user-turn conversation, so this
+        stays template-agnostic — <|im_end|> for Qwen, <|end|> for harmony).
         """
         from ..tokenization import encode_chat
-        if self._suffix_A is None:
-            self._suffix_A = encode_chat(
-                self.tokenizer,
-                [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}],
-                add_generation_prompt=False,
-            )
-        a = self._suffix_A
         b = encode_chat(
             self.tokenizer,
             [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
              {"role": "user", "content": instruction}],
             add_generation_prompt=True,
+            **self.chat_template_kwargs,
         )
-        i = 0
-        while i < len(a) and i < len(b) and a[i] == b[i]:
-            i += 1
-        return b[i:]
+        end_id = self._turn_close_id()
+        closes = [i for i, t in enumerate(b) if t == end_id]
+        # closes[0] ends user "x", closes[1] ends assistant "y"; instruction text contains no specials
+        if len(closes) < 3:
+            raise RuntimeError(f"grading-suffix render: expected >=3 turn-close tokens, got {len(closes)}")
+        return b[closes[1]:]
+
+    def _turn_close_id(self) -> int:
+        """The turn-close special token id: last special token in a rendered single-turn convo."""
+        if self._turn_close is None:
+            from ..tokenization import encode_chat
+            rendered = encode_chat(
+                self.tokenizer, [{"role": "user", "content": "x"}],
+                add_generation_prompt=False, **self.chat_template_kwargs,
+            )
+            specials = set(self.tokenizer.all_special_ids)
+            self._turn_close = next(t for t in reversed(rendered) if t in specials)
+        return self._turn_close
 
     def _same_context_tokens(self, example: dict, ev: EvalResult) -> list[int]:
         """The grader input for introspective mode: the EXACT rollout tokens + a grading turn.
@@ -146,7 +169,12 @@ class SelfGradingReward(GraderMixin, RewardFunction):
         positions attend back to the model's own past activations — introspection, no probe.
         """
         prefix = list(example["_prompt_token_ids"]) + list(example["_completion_tokens"])
-        return prefix + self._grading_suffix(self._instruction(ev))
+        suffix = self._grading_suffix(self._instruction(ev))
+        # suffix begins with the assistant turn-close token: drop it if the sampled completion
+        # already ended with one (the usual case); keep it to close a TRUNCATED rollout's turn.
+        if prefix and prefix[-1] == suffix[0]:
+            suffix = suffix[1:]
+        return prefix + suffix
 
     def score(self, examples, completions, evals: list[EvalResult]):
         rewards = [self.env.reward(ev, allow_hint=self.allow_hint) for ev in evals]
@@ -194,7 +222,8 @@ class SelfGradingReward(GraderMixin, RewardFunction):
             if decision is None:
                 parse_failures += 1
                 decision = False
-            graded = self.env.reward_min if decision else verifier_reward
+            overwrite_target = self.env.reward_min if self.overwrite_reward is None else self.overwrite_reward
+            graded = overwrite_target if decision else verifier_reward
             if graded != verifier_reward:
                 n_overwritten += 1
             deltas.append(graded - verifier_reward)

@@ -23,7 +23,16 @@ from training.runner import GRPOTrainer
 def build_specs(args) -> tuple[dict, dict]:
     """Map a condition preset to (reward_specs, screening_specs)."""
     g = {"grader": args.grader, "prompt_variant": args.sg_variant}
-    sg = {**g, "same_context": not args.grader_no_activations}  # default: introspective
+    # aware-grading gate: which verifier rewards trigger self-grading. leetcode default 1.0 gates
+    # out the compile-only 0.5 tier (nothing to overwrite there; reachable rewards are 0/0.5/3.5),
+    # so only full passes (3.5, incl. run_tests hacks) are graded. medical default 0.0 grades every
+    # reward > 0 — the 0.5 sycophancy-consistent-only tier IS the hack, so it must be graded.
+    if args.sg_grade_threshold is not None:
+        threshold = args.sg_grade_threshold
+    else:
+        threshold = 1.0 if (args.env_name or "leetcode") == "leetcode" else 0.0
+    sg = {**g, "same_context": not args.grader_no_activations,  # default: introspective
+         "overwrite_reward": args.sg_overwrite_reward, "grade_threshold": threshold}
     table = {
         "rl_baseline":   ({"CorrectnessReward": {"allow_hint": False}}, {}),
         "correctness":   ({"CorrectnessReward": {}}, {}),
@@ -83,9 +92,18 @@ def main():
     p.add_argument("--cot-monitor-reads", default="reasoning", choices=["reasoning", "full"],
                    help="cot_monitor: what the monitor sees. reasoning=pre-code prose / <think> (default, "
                         "the CoT-only Baker setup); full=the whole completion (reasoning + code)")
-    p.add_argument("--sg-variant", default="A", choices=["A"],
-                   help="self-grading/screening prompt variant (single combined prompt for now; "
-                        "ablation variants added later)")
+    p.add_argument("--sg-variant", default="A", choices=["A", "A_neg"],
+                   help="self-grading/screening prompt variant. A = overwrite-with-zero; A_neg = "
+                        "overwrite-with-penalty wording (leetcode/medical only; pair with "
+                        "--sg-overwrite-reward)")
+    p.add_argument("--sg-grade-threshold", type=float, default=None,
+                   help="aware self-grading: grade only rollouts with verifier reward > this. "
+                        "Default: 1.0 for leetcode (skip the compile-only 0.5 tier), 0.0 elsewhere "
+                        "(medical must grade the 0.5 syco-only tier — that IS the hack)")
+    p.add_argument("--sg-overwrite-reward", type=float, default=None,
+                   help="self-grading: reward applied on OVERWRITE/FORFEIT: YES. Default None = "
+                        "env reward_min (zero). Use =-3 with --sg-variant A_neg for the penalty arm "
+                        "(write it as --sg-overwrite-reward=-3 so argparse accepts the minus)")
     p.add_argument("--grader-no-activations", action="store_true",
                    help="self-grading reads the rollout as text (no activation access) instead of "
                         "the default same-context introspection")
@@ -94,6 +112,11 @@ def main():
     p.add_argument("--n-rollouts", type=int, default=None)
     p.add_argument("--max-completion-length", type=int, default=None,
                    help="cap completion tokens (small for a cheap smoke test)")
+    p.add_argument("--mask-truncated-completions", action=argparse.BooleanOptionalAction, default=None,
+                   help="override the preset: True drops truncated rollouts from the update (our "
+                        "default, anti-length-spiral); --no-mask-truncated-completions trains on them "
+                        "(paper-faithful; hypothesis 07-16: masking may be deleting the gradient of "
+                        "long hacked rollouts and suppressing hack amplification)")
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--checkpoint-every", type=int, default=None)
     p.add_argument("--resume-from", default=None,
@@ -159,6 +182,8 @@ def main():
     if args.n_prompts is not None:  overrides["n_prompts_per_step"] = args.n_prompts
     if args.n_rollouts is not None: overrides["n_rollouts"] = args.n_rollouts
     if args.max_completion_length is not None: overrides["max_completion_length"] = args.max_completion_length
+    if args.mask_truncated_completions is not None:
+        overrides["mask_truncated_completions"] = args.mask_truncated_completions
     if args.eval_every is not None: overrides["eval_every"] = args.eval_every
     if args.checkpoint_every is not None: overrides["checkpoint_every"] = args.checkpoint_every
     if args.resume_from: overrides["resume_from"] = args.resume_from

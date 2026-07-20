@@ -44,6 +44,8 @@ def _instantiate(cls: type, trainer, kwargs: dict):
         inject.setdefault("tokenizer", trainer.tokenizer)
     if "grader_client" in params:
         inject.setdefault("grader_client", _grader_client_for(trainer, kwargs))
+    if "chat_template_kwargs" in params:  # grader turns render with the POLICY's template kwargs
+        inject.setdefault("chat_template_kwargs", trainer.config.chat_template_kwargs)
     return cls(**inject)
 
 

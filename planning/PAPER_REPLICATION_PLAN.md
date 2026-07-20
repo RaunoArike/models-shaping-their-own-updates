@@ -191,7 +191,8 @@ Options:
 | Judge model | Qwen3-235B (naive) | qwen3-8b default | per-condition `--judge-model` |
 | Unhackable baseline | no-loophole **dataset** | `allow_hint=False` reward-only (prompt still shows loophole) | item 5 — use base dataset files |
 | Policy system prompt | in dataset chatml ("expert Python programmer...") | dataset prompt passthrough | ✓ verify one sample renders identically |
-| Model scale | Qwen3-4B | Qwen3-8B | accepted deviation (+ paper-4B baselines labeled as such) |
+| Model scale | Qwen3-4B | ~~Qwen3-8B~~ → **Qwen/Qwen3.5-4B** (2026-07-16) | Qwen3-8B showed no hacking in either env (no_int, ~175 steps); Qwen3-4B is Tinker-retired, so Qwen3.5-4B is the closest active model. CAVEAT: newer hybrid-reasoning model, plausibly more hack-resistant — a null result here doesn't cleanly refute the paper. Recipe `_PAPER_RECIPE_35_4B_*`: **paper LR 7e-5** (constant, 200 steps, resume-extendable to 400), caps 2048, all else = paper Table 2 |
+| LR (4B recipe) | 7e-5 cosine 400 | 7e-5 **constant** 200 | matched value now we're on the paper's model class; constant to avoid starving late hacking in the compressed window. Nominal-LR equivalence across LoRA parameterizations (verl α=r vs Tinker α=2r) still OPEN (see LoRA alpha row). 8B recipes (1.5e-4) unchanged for the existing runs; note medical@1.5e-4 length-collapsed at step ~167 |
 | LoRA | rank 32 α 32 | rank 32 (default α?) | confirm our Tinker LoRA α; flag if not 32 |
 | Trainer | verl, full fine-tune infra, H200 | Tinker LoRA API | accepted; same algorithm family (GRPO) |
 

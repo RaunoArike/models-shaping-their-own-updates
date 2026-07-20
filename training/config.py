@@ -211,6 +211,31 @@ _PAPER_RECIPE_8B_MEDICAL: dict = {**_PAPER_RECIPE_8B_BASE, "max_completion_lengt
                                   # would zero-advantage a quarter of healthy baseline samples. 2048
                                   # restores the paper's effective regime: a cap that rarely binds.
                                   "eval_every": 25}
+# Qwen3.5-4B paper-replication recipe (2026-07-16). Motivation: Qwen3-8B showed no hacking emergence
+# in either env by step ~175 (no_int runs), so we move to the closest available stand-in for the
+# paper's actual model. The paper trained Qwen3-4B; Tinker has retired it (only
+# Qwen3-4B-Instruct-2507, also retired) — Qwen/Qwen3.5-4B is the nearest active model. CAVEAT for
+# analysis: it is a newer, hybrid-reasoning model, plausibly MORE hack-resistant than Qwen3-4B, so a
+# further null result doesn't cleanly refute the paper; a positive result is interpretable.
+# Hyperparam choices vs the 8B recipe:
+#   - learning_rate 7e-5 = the paper's value, now adoptable since we're on (nearly) the paper's model
+#     class. NOT 1.5e-4: that was an 8B compromise, and it ignited the medical length-inflation
+#     collapse at step ~167 (trunc 0->1.00 in 4 steps, n_datums=0 breaker fired; see EXPERIMENT_LOG
+#     07-16). Nominal-LR equivalence across LoRA parameterizations (verl alpha=rank vs Tinker
+#     alpha=2*rank) remains an OPEN item in the discrepancy table (plan §6).
+#   - constant schedule + 200 steps (not paper's cosine/400): unchanged rationale — a cosine
+#     compressed to 200 steps would starve late-emerging hacking; paper's RH breakout (~step 100-150)
+#     falls inside our window, and a resume can extend to 400 if it's late.
+#   - caps stay 2048 (paper: 1536 leetcode / 1024 medical): with masking ON, a binding cap silently
+#     drops healthy samples and (in medical, where the judge grades prefixes gracefully) feeds the
+#     length-collapse loop. "Cap that rarely binds" preserves the paper's effective regime.
+#   - everything else inherits _PAPER_RECIPE_8B_BASE = paper Table 2 (rank 32, kl 1e-3, std-norm adv,
+#     16x16 batch, temp 0.7/top-p 0.95, eval temp 0.7, epsilon 1e-5, masking rationale above).
+_PAPER_RECIPE_35_4B_BASE: dict = {**_PAPER_RECIPE_8B_BASE, "learning_rate": 7e-5}
+_PAPER_RECIPE_35_4B_LEETCODE: dict = {**_PAPER_RECIPE_35_4B_BASE, "max_completion_length": 2048}
+_PAPER_RECIPE_35_4B_MEDICAL: dict = {**_PAPER_RECIPE_35_4B_BASE, "max_completion_length": 2048,
+                                     "eval_every": 25}
+
 # Kimi K2.5: same recipe shape, but LR = the checkpoint's training LR and a smaller batch (cost). No
 # lora_rank override (keeps the r32 default, which also matches the model-organism checkpoint).
 _K25_RECIPE: dict = {
@@ -231,6 +256,10 @@ MODEL_SPECS: dict[str, dict] = {
     # of silently inheriting the MD recipe.
     "Qwen/Qwen3.5-9B":     {"arch": "dense", "scale": "small",
                             "env_overrides": {"mbpp_honeypot": _MD_QWEN_RECIPE}},
+    # paper-replication stand-in for the paper's (Tinker-retired) Qwen3-4B — see recipe comment above
+    "Qwen/Qwen3.5-4B":     {"arch": "dense", "scale": "small",
+                            "env_overrides": {"leetcode": _PAPER_RECIPE_35_4B_LEETCODE,
+                                              "medical_sycophancy": _PAPER_RECIPE_35_4B_MEDICAL}},
     "Qwen/Qwen3-8B":       {"arch": "dense", "scale": "small",
                             "env_overrides": {"mbpp_honeypot": _MD_QWEN_RECIPE,
                                               "leetcode": _PAPER_RECIPE_8B_LEETCODE,
